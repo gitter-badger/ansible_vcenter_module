@@ -46,7 +46,7 @@ options:
     required: true
     default: null
     aliases: []
-    choices: [set_perms, restart, revert_snapshot, snapshot, delete_snapshot,  shutdown, clone, delete, upgrade_tools, reconfigure]
+    choices: [set_perms, restart, revert_snapshot, snapshot, delete_snapshot,  shutdown, clone, delete, upgrade_tools, reconfigure, gather_facts]
   ss_name:
     description:
       - snapshot name. for use with action: revert_snapshot
@@ -74,7 +74,7 @@ options:
     required: false
     default: null
     aliases: []
-  admin_pass:
+  login_password:
     description:
       - Password for the Administrator user to send to the customization spec.
     required: false
@@ -126,8 +126,8 @@ options:
     aliases: []
 '''
 
-EXAMPLES='''
-# clone a VM from template, with linux guest customizations. 
+EXAMPLES = '''
+# clone a VM from template, with linux guest customizations.
 - vcenter:
   vcenter_hostname: vcenter.mydomain.local
   username: administrator@local-domain
@@ -148,7 +148,7 @@ EXAMPLES='''
     - example.com
     - example.net
   datacenter_name: Datacenter1
-  cluster_name: Cluseter1 
+  cluster_name: Cluseter1
   vm_disk:
     disk1:
       size_gb: 20
@@ -191,8 +191,11 @@ def main():
             ss_name=dict(required=False, type='str'),
             ss_memory=dict(required=False, default=False, type='bool'),
             action=dict(required=True, type='str',
-                choices=['set_perms', 'restart', 'snapshot', 'revert_snapshot',
-                    'delete_snapshot', 'shutdown', 'clone', 'delete', 'upgrade_tools', 'reconfigure'] ),
+                        choices=['set_perms', 'restart', 'snapshot',
+                                 'revert_snapshot', 'delete_snapshot',
+                                 'shutdown', 'clone', 'delete', 'upgrade_tools',
+                                 'reconfigure', 'gather_facts',
+                                 'change_uuid', 'enable_drs']),
             template=dict(required=False, default=False, type='str'),
             propagate=dict(
                 required=False,
@@ -200,6 +203,7 @@ def main():
                 choices=[True, False]),
             group=dict(required=False, default=False, choices=[True, False]),
             vm_folder=dict(required=False, default=None, type='str'),
+            disable_drs=dict(requiered=False, default=None, type='bool'),
             domain=dict(required=False, default=None, type='str'),
             datacenter_name=dict(required=False, default=None, type='str'),
             cluster_name=dict(required=False, default=None, type='str'),
@@ -222,7 +226,7 @@ def main():
                 type='str',
                 choices=['linux', 'windows']),
             resource_pool=dict(required=False, default=None, type='str'),
-            admin_pass=dict(required=False, default=None, type='str'),
+            login_password=dict(required=False, default=None, type='str'),
         ),
         supports_check_mode=False
     )
@@ -259,8 +263,9 @@ def main():
     domain_name = module.params['domain_name']
     num_cpus = module.params['num_cpus']
     memory_mb = module.params['memory_mb']
-    admin_pass = module.params['admin_pass']
+    login_password = module.params['login_password']
     vm_uuid = module.params['vm_uuid']
+    disable_drs = module.params['disable_drs']
 
     # set up connection
     try:
@@ -286,6 +291,9 @@ def main():
     elif action == 'snapshot':
         vm = find_vm(module, vm_name, vm_uuid, si)
         snapshot_vm(module, vm, vm_name, si, ss_name, ss_memory)
+    elif action == 'enable_drs':
+        vm = find_vm(module, vm_name, vm_uuid, si)
+        enable_vm_drs(module, vm, cluster_name, content)
     elif action == 'revert_snapshot':
         vm = find_vm(module, vm_name, vm_uuid, si)
         revert_snapshot(module, vm, vm_name, ss_name)
@@ -305,7 +313,7 @@ def main():
             num_cpus, memory_mb, vm_disk,
             vm_folder, vnics, resource_pool,
             vm_uuid, resource_pools, os_family,
-            admin_pass, full_name, org_name)
+            login_password, full_name, org_name, disable_drs)
     elif action == 'delete':
         vm = find_vm(module, vm_name, vm_uuid, si)
         delete_vm(module, vm, vm_name)
@@ -315,10 +323,18 @@ def main():
     elif action == 'reconfigure':
         vm = find_vm(module, vm_name, vm_uuid, si)
         reconfigure_vm(module, vm, vm_name, num_cpus, memory_mb, vm_disk)
+    elif action == 'gather_facts':
+        vm = find_vm(module, vm_name, vm_uuid, si)
+        facts = gather_facts(vm)
+        if facts:
+            changed = False
+            module.exit_json(changed=False, ansible_facts=facts)
+    elif action == 'change_uuid':
+        vm = get_obj(content, [vim.VirtualMachine], vm_name)
+        change_uuid(module, vm, vm_name, vm_uuid)
     else:
         module.fail_json(msg='%s is not a supported action' % action)
 
-    # shut this thing down
     atexit.register(Disconnect, si)
 
 
@@ -432,8 +448,28 @@ def shutdown_and_wait(module, vm):
     while vm.summary.runtime.powerState != 'poweredOff':
         wait_timer += 1
         time.sleep(2)
-        if wait_timer > 20:
+        if wait_timer > 60:
             module.fail_json(msg='gave up waiting for VM to shutdown')
+
+
+def change_uuid(module, vm, vm_name, vm_uuid):
+    """re-key a VM with UUID from the database"""
+    changes = []
+    spec = vim.vm.ConfigSpec()
+    current_vm_uuid = vm.config.uuid
+
+    if current_vm_uuid != vm_uuid:
+        changes.append('re-keying %s with %s' % (vm_name, vm_uuid))
+        spec.uuid = vm_uuid
+    else:
+        module.exit_json(changd=False)
+
+    if changes:
+        task = vm.ReconfigVM_Task(spec=spec)
+        wait_for_task(module, task)
+        module.exit_json(changed=True, changes=changes)
+    else:
+        module.exit_json(changed=False)
 
 
 def reconfigure_vm(module, vm, vm_name, num_cpus, memory_mb, vm_disk):
@@ -444,9 +480,38 @@ def reconfigure_vm(module, vm, vm_name, num_cpus, memory_mb, vm_disk):
     dev_changes = None
 
     power_state = vm.summary.runtime.powerState
-    current_cpu = vm.config.hardware.numCPU
-    current_memory = vm.config.hardware.memoryMB
+
+    if num_cpus:
+        cpu_changes = reconfigure_vm_cpu(module, vm, num_cpus)
+        if cpu_changes:
+            for change in cpu_changes:
+                changes.append(change)
+
+    if memory_mb:
+        memory_changes = reconfigure_vm_memory(module, vm, memory_mb)
+        if memory_changes:
+            for change in memory_changes:
+                changes.append(change)
+
+    if vm_disk:
+        disk_changes = reconfigure_vm_disk(module, vm, vm_disk)
+        if disk_changes:
+            for change in disk_changes:
+                changes.append(change)
+
+    if changes:
+        if vm.summary.runtime.powerState != power_state:
+            changes.append('powering on %s' % vm_name)
+            power_on_vm(module, vm)
+        module.exit_json(changed=True, changes=changes)
+    else:
+        module.exit_json(changed=False)
+
+
+def reconfigure_vm_cpu(module, vm, num_cpus):
+    changes = []
     spec = vim.vm.ConfigSpec()
+    current_cpu = vm.config.hardware.numCPU
 
     # Reconfigure CPU
     if num_cpus is not None and int(num_cpus) != int(current_cpu):
@@ -465,6 +530,19 @@ def reconfigure_vm(module, vm, vm_name, num_cpus, memory_mb, vm_disk):
         cpu_diff = int(num_cpus) - int(current_cpu)
         # todo make this message more friendly
         changes.append('cpu difference %s' % cpu_diff)
+
+    if changes:
+        task = vm.ReconfigVM_Task(spec=spec)
+        wait_for_task(module, task)
+
+    return changes
+
+
+def reconfigure_vm_memory(module, vm, memory_mb):
+    changes = []
+    current_memory = vm.config.hardware.memoryMB
+    spec = vim.vm.ConfigSpec()
+    vm_name = vm.config.name
 
     # Reconfigure Memory
     if memory_mb is not None and int(memory_mb) != int(current_memory):
@@ -490,69 +568,68 @@ def reconfigure_vm(module, vm, vm_name, num_cpus, memory_mb, vm_disk):
         memory_diff_mb = int(memory_mb) - int(current_memory)
         changes.append('memory difference is %s' % memory_diff_mb)
 
+    if changes:
+        task = vm.ReconfigVM_Task(spec=spec)
+        wait_for_task(module, task)
+
+    return changes
+
+
+def reconfigure_vm_disk(module, vm, vm_disk):
     # Reconfigure Disks
     # prepare vm_disk dict for use with spec
-    if vm_disk:
-        disk_num = 0
-        # sort the dict so drives get labled properly
-        for disk in sorted(vm_disk.iterkeys()):
-            try:
-                new_size_gb = vm_disk[disk]['size_gb']
-            except KeyError:
-                module.fail_json(msg='size_gb must be defined')
-            try:
-                disk_type = vm_disk[disk]['type']
-            except KeyError:
-                disk_type = 'thin'
-            disk_num += 1
-            vm_disk['Hard disk ' + str(disk_num)] = {}
-            vm_disk['Hard disk ' + str(disk_num)]['size_gb'] = new_size_gb
-            vm_disk['Hard disk ' + str(disk_num)]['type'] = disk_type
-            # after rebuilding the dict, rm the old entry
-            del vm_disk[disk]
+    disk_num = 0
+    changes = []
+    dev_changes = []
+    spec = vim.vm.ConfigSpec()
 
-        # unit_number, or scsi num
-        unit_number = 0
-        dev_changes = []
+    # ensure the keys are int for sorting
+    # vm_disk = {int(k): v for k, v in vm_disk.items()}
+    vm_disk = dict((int(k), v) for k, v in vm_disk.items())
 
-        # loop over items in vm_disk dict.
-        # find any drives that already exist and expand if needed
-        for disk in sorted(vm_disk.iterkeys()):
-            for dev in vm.config.hardware.device:
-                if hasattr(dev.backing, 'fileName'):
-                    if dev.deviceInfo.label == disk:
+    # unit_number, or scsi num
+    unit_number = 0
+
+    # loop over items in vm_disk dict.
+    # find any drives that already exist and expand if needed
+    for disk in sorted(vm_disk.iterkeys()):
+        for dev in vm.config.hardware.device:
+            if hasattr(dev.backing, 'fileName'):
+                disk_label = 'Hard disk ' + str(disk)
+                if dev.deviceInfo.label == disk_label:
+                    unit_number += 1
+                    # unitNumber 7 used by controller
+                    if unit_number == 7:
                         unit_number += 1
-                        # unitNumber 7 used by controller
-                        if unit_number == 7:
-                            unit_number += 1
-                        capacity_in_kb = dev.capacityInKB
-                        disk_size_gb = int(vm_disk[disk]['size_gb'])
-                        new_disk_kb = int(disk_size_gb) * 1024 * 1024
-                        # if proposed disk is larger than existing disk
-                        # we expand it here
-                        if new_disk_kb > capacity_in_kb:
-                            disk_spec = vim.vm.device.VirtualDeviceSpec()
-                            disk_spec.operation = \
-                                vim.vm.device.VirtualDeviceSpec.Operation.edit
-                            disk_spec.device = vim.vm.device.VirtualDisk()
-                            disk_spec.device.key = dev.key
-                            disk_spec.device.backing = \
-                                vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
-                            disk_spec.device.backing.fileName = \
-                                dev.backing.fileName
-                            disk_spec.device.backing.diskMode = \
-                                dev.backing.diskMode
-                            disk_spec.device.controllerKey = dev.controllerKey
-                            disk_spec.device.unitNumber = dev.unitNumber
-                            disk_spec.device.capacityInKB = new_disk_kb
-                            dev_changes.append(disk_spec)
-                            changes.append(
-                                '%s has been expanded to %sGB'
-                                % (disk, vm_disk[disk]['size_gb']))
-                        del vm_disk[disk]
+                    capacity_in_kb = dev.capacityInKB
+                    disk_size_gb = int(vm_disk[disk]['size_gb'])
+                    new_disk_kb = int(disk_size_gb) * 1024 * 1024
+                    # if proposed disk is larger than existing disk
+                    # we expand it here
+                    if new_disk_kb > capacity_in_kb:
+                        disk_spec = vim.vm.device.VirtualDeviceSpec()
+                        disk_spec.operation = \
+                            vim.vm.device.VirtualDeviceSpec.Operation.edit
+                        disk_spec.device = vim.vm.device.VirtualDisk()
+                        disk_spec.device.key = dev.key
+                        disk_spec.device.backing = \
+                            vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
+                        disk_spec.device.backing.fileName = \
+                            dev.backing.fileName
+                        disk_spec.device.backing.diskMode = \
+                            dev.backing.diskMode
+                        disk_spec.device.controllerKey = dev.controllerKey
+                        disk_spec.device.unitNumber = dev.unitNumber
+                        disk_spec.device.capacityInKB = new_disk_kb
+                        dev_changes.append(disk_spec)
+                        changes.append(
+                            '%s has been expanded to %sGB'
+                            % (disk_label, vm_disk[disk]['size_gb']))
+                    del vm_disk[disk]
 
     # any remaining items in the dict weren't found on the VM. add them here
     for disk in sorted(vm_disk.iterkeys()):
+        disk_label = 'Hard disk ' + str(disk)
         new_disk_kb = int(vm_disk[disk]['size_gb']) * 1024 * 1024
         disk_spec = vim.vm.device.VirtualDeviceSpec()
         disk_spec.fileOperation = "create"
@@ -571,19 +648,14 @@ def reconfigure_vm(module, vm, vm_name, num_cpus, memory_mb, vm_disk):
         # unitNumber 7 used by controller
         if unit_number == 7:
             unit_number += 1
-        changes.append('adding %s to VM' % disk)
+        changes.append('adding %s to VM' % disk_label)
 
-    if changes:
-        if dev_changes:
-            spec.deviceChange = dev_changes
+    if dev_changes:
+        spec.deviceChange = dev_changes
         task = vm.ReconfigVM_Task(spec=spec)
         wait_for_task(module, task)
-        if vm.summary.runtime.powerState != power_state:
-            changes.append('powering on %s' % vm_name)
-            power_on_vm(module, vm)
-        module.exit_json(changed=True, changes=changes)
-    else:
-        module.exit_json(changed=False)
+
+    return changes
 
 
 def get_obj(content, vimtype, name):
@@ -600,38 +672,96 @@ def get_obj(content, vimtype, name):
     return obj
 
 
+def get_disk_layout(vm):
+    """ returns a dict of disks on a VM """
+
+    vm_disk = []
+    for dev in vm.config.hardware.device:
+        if 'disk' in dev.deviceInfo.label and hasattr(dev.backing, 'fileName'):
+            disk_label = dev.deviceInfo.label
+            disk_layout = {}
+            disk_layout[disk_label] = {}
+            thin_provisioned = dev.backing.thinProvisioned
+            capacity_in_kb = dev.capacityInKB
+            capacity_in_gb = capacity_in_kb / 1024 / 1024
+            if thin_provisioned:
+                disk_layout[disk_label]['disk_type'] = 'thin'
+            else:
+                disk_layout[disk_label]['disk_type'] = 'thick'
+            disk_layout[disk_label]['size_gb'] = capacity_in_gb
+            vm_disk.append(disk_layout)
+
+    return vm_disk
+
+
 def gather_facts(vm):
     """
     set ansible_facts based on a VMs configuration
-    if tools aren't installed guest ipAddress can't be found
     """
     snapshots = []
     snapshot_list = []
+    ips = []
     try:
         snapshot_list = vm.snapshot.rootSnapshotList
-    except:
+    except AttributeError:
         pass
     for snapshot in snapshot_list:
-        snapshot.append(snapshot.name)
+        snapshots.append(snapshot.name)
+    guest_primary_ipaddress = vm.guest.ipAddress
+    guest_family = vm.guest.guestFamily
+    memory_mb = vm.summary.config.memorySizeMB
+    guest_id = vm.guest.guestId
+    nics = vm.guest.net
+    for nic in nics:
+        for addr in nic.ipAddress:
+            ips.append(addr)
+    memory_gb = memory_mb / 1024
+    num_cpus = vm.summary.config.numCpu
+    vm_disk_layout = get_disk_layout(vm)
 
-    try:
-        guest_primary_ipaddress = vm.guest.ipAddress
-    except:
-        guest_primary_ipaddress = None
-    try:
-        guest_family = vm.guest.guestFamily
-    except:
-        guest_family = None
+    # compute a sum of disk size_gb items
+    total_capacity_in_gb = 0
+    for disk in vm_disk_layout:
+        for item in disk:
+            print disk[item]['size_gb']
+            total_capacity_in_gb += int(disk[item]['size_gb'])
 
-    facts = {
-        'vm_uuid': vm.config.uuid,
-        'guest_primary_ipaddress': guest_primary_ipaddress,
-        'instance_uuid': vm.config.instanceUuid,
-        'snapshots': snapshots,
-        'guest_family': guest_family,
-    }
+    facts = {}
+    facts['vm_uuid'] = vm.config.uuid
+    facts['vm_name'] = vm.config.name
+    if guest_primary_ipaddress:
+        facts['guest_primary_ipaddress'] = guest_primary_ipaddress
+    facts['instance_uuid'] = vm.config.instanceUuid
+    if vm_disk_layout:
+        facts['disk_layout'] = vm_disk_layout
+    if snapshots:
+        facts['snapshots'] = snapshots
+    if guest_family:
+        facts['guest_family'] = guest_family
+    facts['memory_mb'] = memory_mb
+    facts['memory_gb'] = memory_gb
+    facts['num_cpus'] = num_cpus
+    if ips:
+        facts['ips'] = ips
+    facts['disk_capacity_gb'] = total_capacity_in_gb
+    facts['vmware_guest_id'] = guest_id
 
     return facts
+
+
+def get_vnic_count(vm):
+    """"returns the number of vnics a VM has"""
+    count = 0
+    for dev in vm.config.hardware.device:
+        if isinstance(dev, (vim.vm.device.VirtualVmxnet3,
+                            vim.vm.device.VirtualE1000,
+                            vim.vm.device.VirtualVmxnet2,
+                            vim.vm.device.VirtualPCNet32,
+                            vim.vm.device.VirtualE1000e,
+                            vim.vm.device.VirtualVmxnet)):
+            count += 1
+
+    return count
 
 
 def clone_vm(
@@ -639,7 +769,7 @@ def clone_vm(
         suffix_list, datacenter_name, cluster_name,
         datastores, domain_name, num_cpus, memory_mb,
         vm_disk, vm_folder, vnics, resource_pool, vm_uuid,
-        resource_pools, os_family, admin_pass, full_name, org_name):
+        resource_pools, os_family, login_password, full_name, org_name, disable_drs):
     """
     Clones a VM from another VM or template
     does guest customizations on said VM
@@ -674,45 +804,30 @@ def clone_vm(
     devices = []
     adaptermaps = []
 
+    vm_nic_count = get_vnic_count(template)
+    nic_num = 0
+
     for nic in vnics:
-        try:
-            network_type = vnics[nic]['network_type']
-            if network_type != 'dvs' and network_type != 'standard':
-                module.fail_json(msg='network_type must be standard or dvs')
-        except KeyError:
-            module.fail_json(msg='network_type must be defined')
-        try:
-            vswitch_name = vnics[nic]['vswitch']
-        except KeyError:
-            module.fail_json(msg='vswitch must be defined')
-        try:
-            ip = vnics[nic]['ip']
-        except:
-            pass
-        try:
-            netmask = vnics[nic]['netmask']
-        except:
-            pass
-        try:
-            gateway = vnics[nic]['gateway']
-        except:
-            pass
-        try:
-            ipv6_addr = vnics[nic]['ipv6_addr']
-        except:
-            ipv6_addr = None
-            pass
-        try:
-            ipv6_prefix_length = vnics[nic]['ipv6_prefix_length']
-        except:
-            pass
-        try:
-            ipv6_defaultgw = vnics[nic]['ipv6_defaultgw']
-        except:
-            pass
+        nic_num += 1
+
+        network_type = vnics[nic].get('network_type', 'dvs')
+        if network_type != 'dvs' and network_type != 'standard':
+            changes.append('defaulting to dvs network %s is an unsupported network_type' % (network_type))
+            network_type = 'dvs'
+
+        vswitch_name = vnics[nic].get('vswitch', None)
+        ip = vnics[nic].get('ip', None)
+        netmask = vnics[nic].get('netmask', None)
+        gateway = vnics[nic].get('gateway', None)
+        ipv6_addr = vnics[nic].get('ipv6_addr', None)
+        ipv6_prefix_length = vnics[nic].get('ipv6_prefix_length', None)
+        ipv6_defaultgw = vnics[nic].get('ipv6_defaultgw', None)
 
         nic = vim.vm.device.VirtualDeviceSpec()
-        nic.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+        if nic_num > vm_nic_count:
+            nic.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
+        else:
+            nic.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
         nic.device = vim.vm.device.VirtualVmxnet3()
         nic.device.wakeOnLanEnabled = True
         nic.device.addressType = 'assigned'
@@ -723,6 +838,8 @@ def clone_vm(
                 content,
                 [vim.dvs.DistributedVirtualPortgroup],
                 vswitch_name)
+            if not pg_obj:
+                module.fail_json(msg='portgroup %s does not exist' % (vswitch_name))
             dvs_port_connection = vim.dvs.PortConnection()
             dvs_port_connection.portgroupKey = pg_obj.key
             dvs_port_connection.switchUuid = \
@@ -734,34 +851,43 @@ def clone_vm(
             nic.device.deviceInfo.summary = vswitch_name
             nic.device.backing = \
                 vim.vm.device.VirtualEthernetCard.NetworkBackingInfo()
-            nic.device.backing.network = \
-                get_obj(content, [vim.Network], vswitch_name)
+            pg_obj = get_obj(content, [vim.Network], vswitch_name)
+
+            if not pg_obj:
+                module.fail_json(msg='portgroup %s does not exist' % (vswitch_name))
+
+            nic.device.backing.network = pg_obj
             nic.device.backing.deviceName = vswitch_name
             nic.device.backing.useAutoDetect = False
-        nic.device.connectable = vim.vm.device.VirtualDevice.ConnectInfo()
-        nic.device.connectable.startConnected = True
-        nic.device.connectable.allowGuestControl = True
+            nic.device.connectable = vim.vm.device.VirtualDevice.ConnectInfo()
+            nic.device.connectable.startConnected = True
+            nic.device.connectable.allowGuestControl = True
+
         devices.append(nic)
 
         # network guest_map
         guest_map = vim.vm.customization.AdapterMapping()
         guest_map.adapter = vim.vm.customization.IPSettings()
         guest_map.adapter.ip = vim.vm.customization.FixedIp()
-        guest_map.adapter.ip.ipAddress = str(ip)
-        guest_map.adapter.subnetMask = str(netmask)
-        # perhaps try statements here?
+        if ip:
+            guest_map.adapter.ip = vim.vm.customization.FixedIp()
+            guest_map.adapter.ip.ipAddress = str(ip)
+        else:
+            guest_map.adapter.subnetMask = str(netmask)
+        if netmask:
+            guest_map.adapter.subnetMask = str(netmask)
         if ipv6_addr:
             guest_map.adapter.ipV6Spec = \
                 vim.vm.customization.IPSettings.IpV6AddressSpec()
             guest_map.adapter.ipV6Spec.ip = [vim.vm.customization.FixedIpV6()]
             guest_map.adapter.ipV6Spec.ip[0].ipAddress = ipv6_addr
+        if ipv6_prefix_length:
             guest_map.adapter.ipV6Spec.ip[0].subnetMask = \
                 int(ipv6_prefix_length)
+        if ipv6_defaultgw:
             guest_map.adapter.ipV6Spec.gateway = ipv6_defaultgw
-        try:
+        if gateway:
             guest_map.adapter.gateway = gateway
-        except:
-            pass
 
         adaptermaps.append(guest_map)
 
@@ -777,20 +903,30 @@ def clone_vm(
         vmconf.uuid = vm_uuid
 
     globalip = vim.vm.customization.GlobalIPSettings()
-    globalip.dnsServerList = dns_list
+    globalip.dnsServerList = [d.encode('utf-8') for d in dns_list]
     globalip.dnsSuffixList = suffix_list
+
+    # set domain and host names
+    host_name = vm_name
+    if len(vm_name.split('.')) > 1:
+        host_name = vm_name.split('.')[0]
+        host_tuple = vm_name.split('.')
+        # rm host_name portion of domain_name, apppend
+        # domain_name to it
+        host_tuple.pop(0)
+        domain_name = '.'.join(host_tuple) + "." + domain_name
 
     if os_family == 'linux':
         ident = vim.vm.customization.LinuxPrep()
         ident.domain = domain_name
         ident.hostName = vim.vm.customization.FixedName()
-        ident.hostName.name = vm_name
+        ident.hostName.name = host_name
     if os_family == 'windows':
         gui_unattended = vim.vm.customization.GuiUnattended()
         gui_unattended.timeZone = 35
         gui_unattended.autoLogon = False
         gui_unattended.password = vim.vm.customization.Password()
-        gui_unattended.password.value = admin_pass
+        gui_unattended.password.value = login_password
         gui_unattended.password.plainText = True
 
         computer_name = vim.vm.customization.VirtualMachineNameGenerator()
@@ -822,14 +958,17 @@ def clone_vm(
 
     task = template.Clone(folder=destfolder, name=vm_name, spec=clonespec)
     new_vm = wait_for_task(module, task)
+    if disable_drs:
+        disable_vm_drs(module, cluster, new_vm)
+
     changed = True
     changes.append('vm %s has been created' % vm_name)
 
-    # prepare vm_disk to use use with reconfigure
     if vm_disk:
-        reconfigure_vm(
-            module, new_vm, vm_name,
-            num_cpus, memory_mb, vm_disk)
+        disk_changes = reconfigure_vm_disk(module, new_vm, vm_disk)
+        if disk_changes:
+            for change in disk_changes:
+                changes.append(change)
 
     if changed:
         module.exit_json(
@@ -837,18 +976,90 @@ def clone_vm(
             ansible_facts=gather_facts(new_vm))
 
 
+def enable_vm_drs(module, vm, cluster_name, content):
+    """
+    Re-enables DRS for a VM that was previously diabled
+    """
+    changed = False
+    changes = []
+    cluster = get_obj(content, [vim.ClusterComputeResource], cluster_name)
+
+    config_ex = vim.ClusterConfigSpecEx()
+    config_ex_drs_vm_config_spec = []
+    drs_vm_config_spec = vim.ClusterDrsVmConfigSpec()
+    drs_vm_config_spec.operation = 'remove'
+    drs_vm_config_spec.info = vim.ClusterDrsVmConfigInfo()
+    drs_vm_config_spec.removeKey = vm
+    drs_vm_config_spec.info.key = vm
+    drs_vm_config_spec.info.enabled = False
+
+    config_ex_drs_vm_config_spec.append(drs_vm_config_spec)
+    config_ex.drsVmConfigSpec = config_ex_drs_vm_config_spec
+
+    task = cluster.ReconfigureComputeResource_Task(config_ex, True)
+
+    task_done = False
+    while not task_done:
+        if task.info.state == 'error':
+            changed = False
+            task_done = True
+        elif task.info.state == 'success':
+            changed = True
+            changes.append('DRS re-enabled for %s' % vm.config.name)
+            task_done = True
+
+    if changed:
+        module.exit_json(changed=True, changes=changes)
+    else:
+        module.exit_json(changed=False)
+
+
+def disable_vm_drs(module, cluster, vm):
+    """
+    Disable DRS for a VM. for use with clone_vm
+    """
+
+    config_ex = vim.ClusterConfigSpecEx()
+    config_ex_drs_vm_config_spec = []
+    drs_vm_config_spec = vim.ClusterDrsVmConfigSpec()
+    drs_vm_config_spec.operation = 'add'
+    drs_vm_config_spec.info = vim.ClusterDrsVmConfigInfo()
+    drs_vm_config_spec.info.key = vm
+    drs_vm_config_spec.info.enabled = False
+
+    config_ex_drs_vm_config_spec.append(drs_vm_config_spec)
+    config_ex.drsVmConfigSpec = config_ex_drs_vm_config_spec
+
+    task = cluster.ReconfigureComputeResource_Task(config_ex, True)
+    wait_for_task(module, task)
+
+
 def upgrade_tools(module, vm):
     """
     Checks a VM for vmware-tools upgrade
     """
+    wait_timer = 0
     changes = []
+    # save VM's state, power on if needed
+    power_state = vm.summary.runtime.powerState
+    if power_state == 'poweredOff' or power_state == 'suspended':
+        task = vm.PowerOnVM_Task()
+        wait_for_task(module, task)
+        changes.append("VM powered on to install tools")
+
+    # are tools running?
+    while vm.guest.toolsRunningStatus != 'guestToolsRunning':
+        wait_timer += 1
+        time.sleep(2)
+        if wait_timer > 40:
+            module.fail_json(msg='gave up waiting for tools to start')
+
     # get vm tools status
     tools_status = vm.guest.toolsVersionStatus2
     if tools_status == 'guestToolsSupportedOld' or tools_status == 'guestToolsNeedUpgrade':
         task = vm.UpgradeTools_Task()
         wait_for_task(module, task)
         changes.append('vmware-tools upgraded')
-        module.exit_json(changed=True, changes=changes)
     elif tools_status == 'guestToolsCurrent' or tools_status == 'guestToolsSupportedNew' or tools_status == 'guestToolsUnmanaged':
         module.exit_json(changed=False)
     elif tools_status == 'guestToolsTooNew':
@@ -861,6 +1072,14 @@ def upgrade_tools(module, vm):
         module.fail_json(msg='tools too old. install manually')
     else:
         module.fail_json(msg='tools upgrade failed')
+
+    # if the vm was powered off before upgrading tools. shutdown VM here
+    if power_state != vm.summary.runtime.powerState:
+        vm.ShutdownGuest()
+        changes.append("VM Shutdown")
+
+    if changes:
+        module.exit_json(changed=True, changes=changes)
 
 
 def set_permissions(
@@ -954,14 +1173,18 @@ def wait_for_task(module, task):
     """
     Wait for a task to complete
     """
+    # set generic message
+    error_msg = "an error occurred while waiting for task to complete"
     task_done = False
     while not task_done:
         if task.info.state == 'success':
             return task.info.result
 
         if task.info.state == 'error':
+            if isinstance(task.info.error, vim.fault.DuplicateName):
+                error_msg = "an object with the name %s already exists" % task.info.error.name
             module.fail_json(
-                msg="an error occurred while waiting for task to complete")
+                msg=error_msg)
 
 
 def delete_vm(module, vm, vm_name):
@@ -1046,5 +1269,5 @@ def revert_snapshot(module, vm, vm_name, ss_name):
     if changed:
         module.exit_json(changed=True, changes=changes)
 
-#<<INCLUDE_ANSIBLE_MODULE_COMMON>>
+from ansible.module_utils.basic import *
 main()
